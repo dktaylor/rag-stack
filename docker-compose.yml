@@ -30,4 +30,6 @@ services:
 
 volumes:
   qdrant_data:
+    name: rag-stack-qdrant
   open-webui:
+    name: open-webui
