@@ -67,6 +67,9 @@ case "$cmd" in
     _require_env
     python3 "$CLI_PY" index "$@"
     ;;
+  fetch)
+    exec fetch-model "${@:---all}"
+    ;;
   help|--help|-h)
     cat <<'EOF'
 rag — RAG stack control and knowledge base CLI
@@ -78,6 +81,11 @@ Stack:
   rag status             Show container status
   rag logs [svc]         Tail logs
 
+Models:
+  rag fetch              Download all models listed in models.conf
+  rag fetch <model-id>   Download a specific HuggingFace model
+  rag fetch --list       Show configured models and cache status
+
 Knowledge base:
   rag search "query" [--k 5] [--tiers t1,t2] [--framework fw] [--project slug]
   rag add <file>  --tier <tier> [--framework fw] [--project slug] [--tags t1,t2]
@@ -85,7 +93,7 @@ Knowledge base:
   rag index [path] [--project slug]
 
 Tiers: framework | project | common-issues | devops-general
-Config: /opt/rag-stack/.env (OPENWEBUI_URL, OPENWEBUI_TOKEN)
+Config: /opt/rag-stack/.env  Models: /opt/rag-stack/models/
 EOF
     ;;
   *)

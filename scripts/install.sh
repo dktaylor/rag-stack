@@ -34,8 +34,9 @@ if docker inspect open-webui >/dev/null 2>&1; then
 fi
 
 # Deploy files
-s mkdir -p "$DEST/mcp"
+s mkdir -p "$DEST/mcp" "$DEST/models"
 s cp "$SOURCE/docker-compose.yml"     "$DEST/docker-compose.yml"
+s cp "$SOURCE/models.conf"            "$DEST/models.conf"
 s cp "$SOURCE/mcp/openwebui-mcp.py"  "$DEST/mcp/openwebui-mcp.py"
 s cp "$SOURCE/mcp/rag_cli.py"        "$DEST/mcp/rag_cli.py"
 
@@ -48,9 +49,11 @@ fi
 # Own the install dir to the calling user
 s chown -R "${DEVUSER}:${DEVUSER}" "$DEST" 2>/dev/null || true
 
-# Install rag CLI
-s install -m 0755 "$SOURCE/scripts/rag" "$CLI_BIN"
+# Install rag CLI and fetch-model script
+s install -m 0755 "$SOURCE/scripts/rag"         "$CLI_BIN"
+s install -m 0755 "$SOURCE/scripts/fetch-model" /usr/local/bin/fetch-model
 echo "  Installed: $CLI_BIN"
+echo "  Installed: /usr/local/bin/fetch-model"
 
 # Install systemd service (disabled by default — on-demand only)
 if [ -d /etc/systemd/system ]; then
@@ -65,10 +68,11 @@ fi
 
 echo ""
 echo "==> Done. Next steps:"
-echo "  1. rag start                    # start Open WebUI + Qdrant"
-echo "  2. Open http://localhost:3000   # create account, generate API token"
-echo "  3. Edit $DEST/.env             # add OPENWEBUI_TOKEN"
-echo "  4. rag index ~/Projects/<name>  # index a project"
+echo "  1. fetch-model                  # download embedding model (needs network)"
+echo "  2. rag start                    # start Open WebUI + Qdrant"
+echo "  3. Open http://localhost:3000   # create account, generate API token"
+echo "  4. Edit $DEST/.env             # add OPENWEBUI_TOKEN"
+echo "  5. rag index ~/Projects/<name>  # index a project"
 echo ""
 echo "MCP registration (Claude Code):"
 echo "  claude mcp add -s user openwebui-rag \\"
