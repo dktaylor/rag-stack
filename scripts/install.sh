@@ -20,11 +20,17 @@ fi
 
 echo "==> rag-stack install: $SOURCE → $DEST"
 
-# Stop and remove existing standalone open-webui container — it conflicts with
-# the compose-managed one on port 3000. Volume data is preserved (same volume name).
+# Remove a standalone (non-compose) open-webui container if present — it would
+# conflict on port 3000. Compose-managed containers are skipped; volume data is
+# always preserved (named volumes are independent of container lifecycle).
 if docker inspect open-webui >/dev/null 2>&1; then
-    echo "  Removing standalone open-webui container (data preserved in volume)..."
-    docker rm -f open-webui >/dev/null
+    compose_project=$(docker inspect open-webui --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
+    if [ -z "$compose_project" ]; then
+        echo "  Removing standalone open-webui container (data preserved in volume)..."
+        docker rm -f open-webui >/dev/null
+    else
+        echo "  open-webui is compose-managed (project: $compose_project) — leaving it running."
+    fi
 fi
 
 # Deploy files
