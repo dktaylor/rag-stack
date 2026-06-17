@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# rag — RAG stack control and knowledge base CLI
+# Installed to /usr/local/bin/rag by scripts/install.sh
+set -euo pipefail
+
+RAG_DIR="${RAG_INSTALL_DIR:-/opt/rag-stack}"
+COMPOSE_FILE="${RAG_DIR}/docker-compose.yml"
+ENV_FILE="${RAG_DIR}/.env"
+CLI_PY="${RAG_DIR}/mcp/rag_cli.py"
+
+_compose() {
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+_require_stack() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo "rag: stack not installed at $RAG_DIR" >&2
+        echo "Run: rag-stack/scripts/install.sh" >&2
+        exit 1
+    fi
+}
+
+_require_env() {
+    if [ ! -f "$ENV_FILE" ]; then
+        echo "rag: no .env found at $ENV_FILE" >&2
+        echo "Copy .env.example to $ENV_FILE and set OPENWEBUI_TOKEN" >&2
+        exit 1
+    fi
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  start)
+    _require_stack; _require_env
+    echo "Starting RAG stack..."
+    _compose up -d
+    echo "  Open WebUI → http://localhost:3000"
+    echo "  Qdrant     → http://localhost:6333/dashboard"
+    ;;
+  stop)
+    _require_stack
+    _compose down
+    ;;
+  restart)
+    _require_stack; _require_env
+    _compose restart "${@:-}"
+    ;;
+  status)
+    _require_stack
+    _compose ps
+    ;;
+  logs)
+    _require_stack
+    _compose logs -f "${@:-}"
+    ;;
+  search)
+    _require_env
+    python3 "$CLI_PY" search "$@"
+    ;;
+  add)
+    _require_env
+    python3 "$CLI_PY" add "$@"
+    ;;
+  index)
+    _require_env
+    python3 "$CLI_PY" index "$@"
+    ;;
+  help|--help|-h)
+    cat <<'EOF'
+rag — RAG stack control and knowledge base CLI
+
+Stack:
+  rag start              Start Open WebUI + Qdrant
+  rag stop               Stop (data persists in named volumes)
+  rag restart [svc]      Restart all, or one: open-webui | qdrant
+  rag status             Show container status
+  rag logs [svc]         Tail logs
+
+Knowledge base:
+  rag search "query" [--k 5] [--tiers t1,t2] [--framework fw] [--project slug]
+  rag add <file>  --tier <tier> [--framework fw] [--project slug] [--tags t1,t2]
+  rag add --name slug --content "text" --tier <tier> [options]
+  rag index [path] [--project slug]
+
+Tiers: framework | project | common-issues | devops-general
+Config: /opt/rag-stack/.env (OPENWEBUI_URL, OPENWEBUI_TOKEN)
+EOF
+    ;;
+  *)
+    echo "rag: unknown command '$cmd'. Run 'rag help' for usage." >&2
+    exit 1
+    ;;
+esac
