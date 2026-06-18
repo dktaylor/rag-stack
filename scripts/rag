@@ -221,6 +221,8 @@ case "$cmd" in
         if [[ "$_kb_count" == "0" ]]; then
             echo "  Qdrant KB is empty — auto-reindexing projects from indexes.conf..."
             _reindex_all
+        else
+            echo "  Qdrant KB has $_kb_count points — skipping reindex."
         fi
     fi
     ;;
