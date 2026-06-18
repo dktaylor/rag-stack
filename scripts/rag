@@ -28,6 +28,152 @@ _require_env() {
     fi
 }
 
+# _bootstrap — provision Open WebUI account + permanent API key on first start.
+# Writes OPENWEBUI_TOKEN, OPENWEBUI_EMAIL, OPENWEBUI_PASSWORD to .env.
+# Updates ~/.claude.json MCP config if present.
+# Safe to re-run: skips if the existing token is still valid.
+_bootstrap() {
+    local webui_url="http://localhost:3000"
+    local email="admin@localhost"
+
+    # Skip if token is already valid
+    local current_token
+    current_token=$(grep "^OPENWEBUI_TOKEN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]') || true
+    if [[ -n "$current_token" ]]; then
+        local http_status
+        http_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -H "Authorization: Bearer $current_token" \
+            "$webui_url/api/v1/knowledge/" 2>/dev/null) || true
+        if [[ "$http_status" == "200" ]]; then
+            echo "  Token already valid — skipping bootstrap."
+            return 0
+        fi
+        echo "  Existing token invalid (HTTP $http_status) — re-bootstrapping..."
+    fi
+
+    # Wait for Open WebUI to be ready (up to 120s)
+    echo "  Waiting for Open WebUI to be ready..."
+    local ready=0
+    for i in $(seq 1 24); do
+        if curl -sf --max-time 3 "$webui_url/health" >/dev/null 2>&1; then
+            ready=1; break
+        fi
+        sleep 5
+    done
+    if [[ $ready -eq 0 ]]; then
+        echo "  ERROR: Open WebUI did not become healthy within 120s." >&2
+        echo "  Run 'rag logs open-webui' to diagnose, then 'rag bootstrap' to retry." >&2
+        return 1
+    fi
+
+    # Generate a random password for the admin account
+    local password
+    password=$(python3 -c \
+        "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(20)))")
+
+    # Create admin account (signup; may already exist if this is a re-run)
+    curl -s -X POST "$webui_url/api/v1/auths/signup" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"Admin\",\"email\":\"$email\",\"password\":\"$password\"}" \
+        >/dev/null 2>&1 || true
+
+    # Sign in
+    local token
+    token=$(curl -s -X POST "$webui_url/api/v1/auths/signin" \
+        -H "Content-Type: application/json" \
+        -d "{\"email\":\"$email\",\"password\":\"$password\"}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || true
+
+    if [[ -z "$token" ]]; then
+        # Signup existed — try to reset via sqlite and re-sign-in
+        echo "  Account exists with a different password — resetting via container DB..."
+        local hashed
+        hashed=$(docker exec open-webui python3 -c \
+            "import bcrypt; print(bcrypt.hashpw('$password'.encode(), bcrypt.gensalt()).decode())" 2>/dev/null) || true
+        if [[ -n "$hashed" ]]; then
+            docker exec open-webui python3 -c "
+import sqlite3, bcrypt
+h = bcrypt.hashpw('$password'.encode(), bcrypt.gensalt()).decode()
+db = sqlite3.connect('/app/backend/data/webui.db')
+db.execute('UPDATE auth SET password=? WHERE email=?', (h, '$email'))
+db.commit(); db.close()
+" >/dev/null 2>&1 || true
+            token=$(curl -s -X POST "$webui_url/api/v1/auths/signin" \
+                -H "Content-Type: application/json" \
+                -d "{\"email\":\"$email\",\"password\":\"$password\"}" \
+                | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || true
+        fi
+    fi
+
+    if [[ -z "$token" ]]; then
+        echo "  ERROR: Could not sign in to Open WebUI." >&2
+        echo "  Try: rag stop && docker volume rm open-webui && rag start" >&2
+        return 1
+    fi
+
+    # Enable API keys via admin config
+    local config
+    config=$(curl -s "$webui_url/api/v1/auths/admin/config" \
+        -H "Authorization: Bearer $token" 2>/dev/null) || true
+    local patched
+    patched=$(echo "$config" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); d['ENABLE_API_KEYS']=True; print(json.dumps(d))" \
+        2>/dev/null) || true
+    if [[ -n "$patched" ]]; then
+        curl -s -X POST "$webui_url/api/v1/auths/admin/config" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "$patched" >/dev/null 2>&1 || true
+    fi
+
+    # Generate permanent sk-* API key
+    local api_key
+    api_key=$(curl -s -X POST "$webui_url/api/v1/auths/api_key" \
+        -H "Authorization: Bearer $token" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('api_key',''))" \
+        2>/dev/null) || true
+
+    if [[ "$api_key" != sk-* ]]; then
+        echo "  ERROR: Failed to generate API key." >&2
+        return 1
+    fi
+
+    # Write credentials to .env
+    _env_set() {
+        local key="$1" val="$2"
+        grep -q "^${key}=" "$ENV_FILE" \
+            && sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" \
+            || echo "${key}=${val}" >> "$ENV_FILE"
+    }
+    _env_set OPENWEBUI_TOKEN    "$api_key"
+    _env_set OPENWEBUI_EMAIL    "$email"
+    _env_set OPENWEBUI_PASSWORD "$password"
+
+    # Update ~/.claude.json MCP config if present
+    local claude_json="${HOME:-/root}/.claude.json"
+    if [[ -f "$claude_json" ]]; then
+        python3 -c "
+import json
+with open('$claude_json') as f:
+    d = json.load(f)
+mcp = d.get('mcpServers', {}).get('openwebui-rag', {})
+if mcp:
+    mcp.setdefault('env', {})['OPENWEBUI_TOKEN'] = '$api_key'
+    d['mcpServers']['openwebui-rag'] = mcp
+    with open('$claude_json', 'w') as f:
+        json.dump(d, f, indent=2)
+    print('  Updated ~/.claude.json MCP token.')
+" 2>/dev/null || true
+    fi
+
+    echo "  Bootstrap complete."
+    echo "    Email:    $email"
+    echo "    Password: $password  (also stored in $ENV_FILE)"
+    echo "    API key:  $api_key"
+    echo "  Open http://localhost:3000 to use Open WebUI."
+    echo "  Start a new Claude Code session to reload the MCP token."
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -38,6 +184,12 @@ case "$cmd" in
     _compose up -d
     echo "  Open WebUI → http://localhost:3000"
     echo "  Qdrant     → http://localhost:6333/dashboard"
+    # Auto-bootstrap on first start when no token is set
+    local_token=$(grep "^OPENWEBUI_TOKEN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]') || true
+    if [[ -z "$local_token" ]]; then
+        echo "  No API token found — running first-time bootstrap..."
+        _bootstrap
+    fi
     ;;
   stop)
     _require_stack
@@ -54,6 +206,10 @@ case "$cmd" in
   logs)
     _require_stack
     _compose logs -f "${@:-}"
+    ;;
+  bootstrap)
+    _require_stack; _require_env
+    _bootstrap
     ;;
   search)
     _require_env
@@ -75,11 +231,12 @@ case "$cmd" in
 rag — RAG stack control and knowledge base CLI
 
 Stack:
-  rag start              Start Open WebUI + Qdrant
+  rag start              Start Open WebUI + Qdrant (auto-bootstraps on first run)
   rag stop               Stop (data persists in named volumes)
   rag restart [svc]      Restart all, or one: open-webui | qdrant
   rag status             Show container status
   rag logs [svc]         Tail logs
+  rag bootstrap          Re-run first-time account + API key setup
 
 Models:
   rag fetch              Download all models listed in models.conf
