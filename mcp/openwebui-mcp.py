@@ -419,6 +419,19 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
         + (f", {errors} errors" if errors else "")
     )
     print(f"openwebui-mcp: {result}", file=sys.stderr)
+
+    # Record path for auto-reindex recovery (rag start restores this on empty Qdrant)
+    if uploaded > 0:
+        indexes_conf = Path(os.environ.get("RAG_INSTALL_DIR", "/opt/rag-stack")) / "indexes.conf"
+        try:
+            existing = indexes_conf.read_text().splitlines() if indexes_conf.exists() else []
+            root_str = str(root)
+            if root_str not in existing:
+                with indexes_conf.open("a") as fh:
+                    fh.write(root_str + "\n")
+        except Exception:
+            pass
+
     return result
 
 

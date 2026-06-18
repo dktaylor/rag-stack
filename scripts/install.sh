@@ -51,6 +51,12 @@ if [ ! -f "$DEST/.env" ]; then
     echo "  Created $DEST/.env — add OPENWEBUI_TOKEN after first start"
 fi
 
+# Seed indexes.conf if not already present (never overwrite — user may have added paths)
+if [ ! -f "$DEST/indexes.conf" ] && [ -f "$SOURCE/indexes.conf" ]; then
+    s cp "$SOURCE/indexes.conf" "$DEST/indexes.conf"
+    echo "  Created $DEST/indexes.conf — lists projects to auto-reindex on empty Qdrant"
+fi
+
 # Own the install dir to the calling user
 s chown -R "${DEVUSER}:${DEVUSER}" "$DEST" 2>/dev/null || true
 

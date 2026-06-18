@@ -174,6 +174,23 @@ if mcp:
     echo "  Start a new Claude Code session to reload the MCP token."
 }
 
+_reindex_all() {
+    local conf="$RAG_DIR/indexes.conf"
+    [ -f "$conf" ] || return 0
+    local found=0
+    while IFS= read -r proj_path; do
+        [[ -z "$proj_path" || "${proj_path:0:1}" == "#" ]] && continue
+        found=1
+        if [ -d "$proj_path" ]; then
+            echo "  Indexing: $proj_path"
+            python3 "$CLI_PY" index "$proj_path" 2>&1 | sed 's/^/    /'
+        else
+            echo "  Skipping (not found): $proj_path" >&2
+        fi
+    done < "$conf"
+    [[ $found -eq 0 ]] && echo "  indexes.conf is empty — add paths with 'rag index <path>'" >&2
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -189,6 +206,22 @@ case "$cmd" in
     if [[ -z "$local_token" ]]; then
         echo "  No API token found — running first-time bootstrap..."
         _bootstrap
+    else
+        # Wait for Open WebUI to be ready (up to 60s) before checking Qdrant
+        for _wi in $(seq 1 12); do
+            curl -sf --max-time 3 "http://localhost:3000/health" >/dev/null 2>&1 && break
+            sleep 5
+        done
+    fi
+    # Auto-reindex if Qdrant KB is empty and indexes.conf lists projects to restore
+    if [ -f "$RAG_DIR/indexes.conf" ]; then
+        _kb_count=$(curl -sf --max-time 5 "http://localhost:6333/collections/open-webui_knowledge" 2>/dev/null \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('points_count',0))" \
+            2>/dev/null || echo "0")
+        if [[ "$_kb_count" == "0" ]]; then
+            echo "  Qdrant KB is empty — auto-reindexing projects from indexes.conf..."
+            _reindex_all
+        fi
     fi
     ;;
   stop)
@@ -211,6 +244,15 @@ case "$cmd" in
     _require_stack; _require_env
     _bootstrap
     ;;
+  reindex)
+    _require_stack; _require_env
+    if [ ! -f "$RAG_DIR/indexes.conf" ]; then
+        echo "rag: no indexes.conf — run 'rag index <path>' to register projects" >&2
+        exit 1
+    fi
+    echo "Reindexing all projects from $RAG_DIR/indexes.conf..."
+    _reindex_all
+    ;;
   search)
     _require_env
     python3 "$CLI_PY" search "$@"
@@ -231,12 +273,13 @@ case "$cmd" in
 rag — RAG stack control and knowledge base CLI
 
 Stack:
-  rag start              Start Open WebUI + Qdrant (auto-bootstraps on first run)
+  rag start              Start Open WebUI + Qdrant (auto-bootstraps + auto-reindexes if empty)
   rag stop               Stop (data persists in named volumes)
   rag restart [svc]      Restart all, or one: open-webui | qdrant
   rag status             Show container status
   rag logs [svc]         Tail logs
   rag bootstrap          Re-run first-time account + API key setup
+  rag reindex            Re-index all projects listed in indexes.conf
 
 Models:
   rag fetch              Download all models listed in models.conf
