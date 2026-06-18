@@ -36,4 +36,5 @@ volumes:
   qdrant_data:
     name: rag-stack-qdrant
   open-webui:
+    external: true
     name: open-webui

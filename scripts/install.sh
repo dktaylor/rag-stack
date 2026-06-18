@@ -33,6 +33,11 @@ if docker inspect open-webui >/dev/null 2>&1; then
     fi
 fi
 
+# Ensure the open-webui named volume exists before compose starts.
+# The volume is declared external: true in docker-compose.yml so compose
+# won't try to own or rename it — but it must exist before `rag start`.
+docker volume create open-webui >/dev/null 2>&1 || true
+
 # Deploy files
 s mkdir -p "$DEST/mcp" "$DEST/models"
 s cp "$SOURCE/docker-compose.yml"     "$DEST/docker-compose.yml"
