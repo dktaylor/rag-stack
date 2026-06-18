@@ -5,7 +5,7 @@ services:
     ports:
       - "6333:6333"
     volumes:
-      - qdrant_data:/qdrant/storage
+      - ./data/qdrant:/qdrant/storage:z
     restart: unless-stopped
     environment:
       - QDRANT__SERVICE__ANALYTICS_TRACKING=false
@@ -16,7 +16,7 @@ services:
     ports:
       - "3000:8080"
     volumes:
-      - open-webui:/app/backend/data
+      - ./data/webui:/app/backend/data:z
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - VECTOR_DB=qdrant
@@ -32,9 +32,3 @@ services:
       - qdrant
     restart: unless-stopped
 
-volumes:
-  qdrant_data:
-    name: rag-stack-qdrant
-  open-webui:
-    external: true
-    name: open-webui

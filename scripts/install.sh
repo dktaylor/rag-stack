@@ -22,21 +22,20 @@ echo "==> rag-stack install: $SOURCE → $DEST"
 
 # Remove a standalone (non-compose) open-webui container if present — it would
 # conflict on port 3000. Compose-managed containers are skipped; volume data is
-# always preserved (named volumes are independent of container lifecycle).
+# always preserved (bind-mounted host directories are independent of container lifecycle).
 if docker inspect open-webui >/dev/null 2>&1; then
     compose_project=$(docker inspect open-webui --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
     if [ -z "$compose_project" ]; then
-        echo "  Removing standalone open-webui container (data preserved in volume)..."
+        echo "  Removing standalone open-webui container (data preserved in $DEST/data/)..."
         docker rm -f open-webui >/dev/null
     else
         echo "  open-webui is compose-managed (project: $compose_project) — leaving it running."
     fi
 fi
 
-# Ensure the open-webui named volume exists before compose starts.
-# The volume is declared external: true in docker-compose.yml so compose
-# won't try to own or rename it — but it must exist before `rag start`.
-docker volume create open-webui >/dev/null 2>&1 || true
+# Create host-side data directories for Qdrant and Open WebUI.
+# Bind-mounted paths are unaffected by Docker volume pruning or 'compose down -v'.
+s mkdir -p "$DEST/data/qdrant" "$DEST/data/webui"
 
 # Deploy files
 s mkdir -p "$DEST/mcp" "$DEST/models"
@@ -54,7 +53,7 @@ fi
 # Seed indexes.conf if not already present (never overwrite — user may have added paths)
 if [ ! -f "$DEST/indexes.conf" ] && [ -f "$SOURCE/indexes.conf" ]; then
     s cp "$SOURCE/indexes.conf" "$DEST/indexes.conf"
-    echo "  Created $DEST/indexes.conf — lists projects to auto-reindex on empty Qdrant"
+    echo "  Created $DEST/indexes.conf"
 fi
 
 # Own the install dir to the calling user
