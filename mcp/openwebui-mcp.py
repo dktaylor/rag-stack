@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-openwebui-mcp.py — Four-tier MCP stdio server bridging Hermes/Claude to Open WebUI RAG
+openwebui-mcp.py — Five-tier MCP stdio server bridging Hermes/Claude to Open WebUI RAG
 
 Tiers:
   1  framework-{name}   PHP framework/CMS reference (Drupal, Symfony, WordPress, CakePHP, Laravel…)
   2  project-{slug}     Per-project source code + project-specific devops/config
   3  common-issues      Cross-cutting gotchas, bugs, non-obvious fixes (all stacks)
-  4  devops-general     Infrastructure reference — Docker, k8s, Linux, nginx, OS patterns
+  4  devops-general     Infrastructure reference — Docker, k8s, nginx, SSL (platform-agnostic)
+  5  os-{distro}        OS-specific reference — package names, firewall rules, SELinux, distro quirks
+                        Auto-included in every search when the KB exists (no caller action needed).
 
 Tools:
   rag_search(query, k, tiers, framework, project)
@@ -20,7 +22,8 @@ Config via environment:
   OPENWEBUI_TOKEN    JWT auth token
   RAG_CWD_DETECT     set to "1" to auto-detect project/framework from CWD (default: 1)
 
-OS context applies to Tier 4 (devops-general) only — search combines tiers naturally.
+OS detection: _detect_os() identifies distro at startup; _os_kb_name() maps it to os-{distro}.
+Every rag_search() auto-includes os-{distro} when that KB exists.
 
 MCP transport: NDJSON (newline-delimited JSON-RPC 2.0, Hermes v0.16+ format)
 """
@@ -90,7 +93,10 @@ def _kb_description(name: str) -> str:
     if name == "common-issues":
         return "Tier 3 — Cross-cutting gotchas, bugs, and non-obvious fixes across all stacks"
     if name == "devops-general":
-        return "Tier 4 — Infrastructure reference: Docker, k8s, Linux, nginx, SSL, OS patterns"
+        return "Tier 4 — Infrastructure reference: Docker, k8s, nginx, SSL (platform-agnostic)"
+    if name.startswith("os-"):
+        distro = name[len("os-"):]
+        return f"Tier 5 — {distro.title()} OS reference: package names, firewall rules, SELinux, distro-specific fixes"
     return f"RAG knowledge base: {name}"
 
 
@@ -130,7 +136,7 @@ def _detect_context(cwd: str | None = None) -> tuple[str | None, str | None]:
 
 
 def _detect_os() -> str:
-    """Return a short OS identifier for Tier 4 context."""
+    """Return a short OS identifier, e.g. 'linux-fedora', 'macos'."""
     system = platform.system()
     if system == "Linux":
         try:
@@ -147,6 +153,13 @@ def _detect_os() -> str:
     if system == "Windows":
         return "windows"
     return "unknown"
+
+
+def _os_kb_name() -> str:
+    """Return the Tier 5 KB name for the current host, e.g. 'os-fedora', 'os-macos'."""
+    tag = _detect_os()  # e.g. "linux-fedora", "macos", "linux"
+    short = tag.removeprefix("linux-")  # "linux-fedora" → "fedora", "macos" → "macos"
+    return f"os-{short}"
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +248,10 @@ def _resolve_kb_ids(tiers: list, framework: str | None, project: str | None) -> 
         elif tier == "devops-general":
             if "devops-general" in _KB_CACHE:
                 ids.append(_KB_CACHE["devops-general"])
+        elif tier == "os":
+            os_name = _os_kb_name()
+            if os_name in _KB_CACHE:
+                ids.append(_KB_CACHE[os_name])
     # deduplicate, preserve order
     seen = set()
     return [x for x in ids if not (x in seen or seen.add(x))]
@@ -263,6 +280,12 @@ def rag_search(
 
     _refresh_kb_cache()
     kb_ids = _resolve_kb_ids(tiers, framework, project)
+
+    # Auto-include os-{distro} KB (Tier 5) when it exists, unless caller already specified "os"
+    if "os" not in tiers:
+        os_id = _KB_CACHE.get(_os_kb_name())
+        if os_id and os_id not in kb_ids:
+            kb_ids.append(os_id)
 
     if not kb_ids:
         avail = ", ".join(sorted(_KB_CACHE)) or "none"
@@ -319,10 +342,12 @@ def rag_add_doc(
         kb_name = "common-issues"
     elif tier in ("devops-general", "devops"):
         kb_name = "devops-general"
+    elif tier == "os":
+        kb_name = _os_kb_name()
     else:
         return (
             f"Error: unknown tier '{tier}'. "
-            "Valid values: framework, project, common-issues, devops-general"
+            "Valid values: framework, project, common-issues, devops-general, os"
         )
 
     if tags:
@@ -446,6 +471,7 @@ def rag_list_kbs() -> str:
         "2 — project":        [],
         "3 — common-issues":  [],
         "4 — devops-general": [],
+        "5 — os":             [],
         "other":              [],
     }
 
@@ -467,6 +493,8 @@ def rag_list_kbs() -> str:
             tiers["3 — common-issues"].append(entry)
         elif name == "devops-general":
             tiers["4 — devops-general"].append(entry)
+        elif name.startswith("os-"):
+            tiers["5 — os"].append(entry)
         else:
             tiers["other"].append(entry)
 
@@ -488,10 +516,12 @@ TOOLS = [
             "Search the RAG knowledge base across one or more tiers. "
             "Call this FIRST before making changes — query for prior decisions, patterns, and fixes. "
             "Auto-detects framework and project from CWD when not specified. "
+            "Tier 5 (os-{distro}) is automatically included when the KB exists — no need to add it. "
             "Tiers: 'framework' (Tier 1 — PHP framework/CMS docs), "
             "'project' (Tier 2 — current project code), "
             "'common-issues' (Tier 3 — cross-cutting gotchas), "
-            "'devops-general' (Tier 4 — infrastructure + OS patterns)."
+            "'devops-general' (Tier 4 — platform-agnostic infra: Docker, nginx, k8s), "
+            "'os' (Tier 5 — OS-specific: package names, firewall rules, distro quirks)."
         ),
         "inputSchema": {
             "type": "object",
@@ -510,7 +540,8 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": (
                         "Tiers to search. Default: ['framework','project','common-issues']. "
-                        "Add 'devops-general' for infrastructure/OS topics."
+                        "os-{distro} (Tier 5) is always auto-included when the KB exists. "
+                        "Add 'devops-general' for platform-agnostic infrastructure topics."
                     ),
                     "default": ["framework", "project", "common-issues"],
                 },
@@ -535,14 +566,15 @@ TOOLS = [
             "tier='framework' requires framework param. "
             "tier='project' auto-detects project from CWD. "
             "tier='common-issues' for cross-cutting gotchas. "
-            "tier='devops-general' for infrastructure reference docs."
+            "tier='devops-general' for platform-agnostic infrastructure reference docs. "
+            "tier='os' for OS-specific fixes — auto-detects distro (e.g. os-fedora on Fedora)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name":      {"type": "string", "description": "Filename slug"},
                 "content":   {"type": "string", "description": "Document content"},
-                "tier":      {"type": "string", "description": "framework | project | common-issues | devops-general"},
+                "tier":      {"type": "string", "description": "framework | project | common-issues | devops-general | os"},
                 "framework": {"type": "string", "description": "Required when tier=framework"},
                 "project":   {"type": "string", "description": "Project slug — defaults to CWD basename"},
                 "tags":      {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
