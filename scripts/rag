@@ -166,6 +166,10 @@ if mcp:
 " 2>/dev/null || true
     fi
 
+    # Pre-create fixed-type tier KBs so they exist before the first agent session
+    echo "  Initializing tier knowledge bases..."
+    python3 "$CLI_PY" init-tiers 2>&1 | sed 's/^/    /' || true
+
     echo "  Bootstrap complete."
     echo "    Email:    $email"
     echo "    Password: $password  (also stored in $ENV_FILE)"
@@ -255,6 +259,15 @@ case "$cmd" in
     echo "Reindexing all projects from $RAG_DIR/indexes.conf..."
     _reindex_all
     ;;
+  tiers)
+    _require_env
+    python3 "$CLI_PY" tiers
+    ;;
+  init-tiers)
+    _require_env
+    echo "Initializing tier knowledge bases..."
+    python3 "$CLI_PY" init-tiers
+    ;;
   search)
     _require_env
     python3 "$CLI_PY" search "$@"
@@ -271,7 +284,7 @@ case "$cmd" in
     exec fetch-model "${@:---all}"
     ;;
   help|--help|-h)
-    cat <<'EOF'
+    cat <<EOF
 rag — RAG stack control and knowledge base CLI
 
 Stack:
@@ -293,9 +306,10 @@ Knowledge base:
   rag add <file>  --tier <tier> [--framework fw] [--project slug] [--tags t1,t2]
   rag add --name slug --content "text" --tier <tier> [options]
   rag index [path] [--project slug]
+  rag tiers              List configured tiers and their search behaviour
+  rag init-tiers         Pre-create fixed-type tier KBs in Open WebUI
 
-Tiers: framework | project | common-issues | devops-general
-Config: /opt/rag-stack/.env  Models: /opt/rag-stack/models/
+Config: $RAG_DIR/.env  Tiers: $RAG_DIR/tiers.json  Models: $RAG_DIR/models/
 EOF
     ;;
   *)

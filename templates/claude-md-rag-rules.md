@@ -1,19 +1,32 @@
 ## RAG Integration Rules
 
-The project uses a four-tier RAG system via Open WebUI. MCP tools are available:
+The project uses a configurable-tier RAG system via Open WebUI. MCP tools are available:
 `rag_search`, `rag_add_doc`, `rag_add_issue`, `rag_index_project`, `rag_list_kbs`.
 
-### Four-tier knowledge structure
+### Tier knowledge structure
 
 | Tier | KB name | Contains |
 |------|---------|---------|
 | 1 | `framework-{name}` | Framework/CMS reference — hooks, APIs, services, patterns |
 | 2 | `project-{slug}` | Per-project source code + project-specific devops/config |
 | 3 | `common-issues` | Cross-cutting gotchas, bugs, non-obvious fixes (all stacks) |
-| 4 | `devops-general` | Infrastructure reference — Docker, k8s, Linux, nginx, SSL |
+| 4 | `devops-general` | Infrastructure reference — Docker, k8s, nginx, SSL (platform-agnostic) |
+| 5 | `os-{distro}` | OS-specific fixes — package names, firewall rules, SELinux, distro quirks |
 
 This project's code lives in `project-{slug}` (Tier 2). Replace `{slug}` with the
 directory basename of this repository.
+
+### Search behaviour
+
+- **Default search** (`rag_search` with no `tiers` arg): searches Tiers 1–3
+- **Tier 5 (`os-{distro}`)**: always auto-included in every search when the KB exists — no action needed
+- **Tier 4 (`devops-general`)**: opt-in — pass `tiers=[..., "devops-general"]` for infra questions
+- **Passing `tiers=[...]` replaces the defaults, it does not add to them.** Include all tiers you want:
+
+```python
+# Extend defaults to include Tier 4
+rag_search(query="nginx proxy config", tiers=["framework", "project", "common-issues", "devops-general"])
+```
 
 ### Excluded paths — never read directly
 

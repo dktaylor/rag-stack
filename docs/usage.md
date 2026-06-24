@@ -19,13 +19,36 @@ A flat single knowledge base forces every query to search everything — framewo
 
 ### Default search tiers
 
-When you call `rag_search` without specifying tiers, it searches Tiers 1–3:
+When you call `rag_search` without specifying `tiers`, it searches the tiers listed in `default_tiers` in `tiers.json`. With the shipped config that's Tiers 1–3:
 
 ```
 ["framework", "project", "common-issues"]
 ```
 
-Add `"devops-general"` explicitly for infrastructure questions. This keeps the default result set focused on code rather than ops.
+**Why not search everything by default?** Infrastructure docs (Tier 4) and OS quirks (Tier 5) are rarely relevant to code questions — including them in every search dilutes the results. The tiers not in `default_tiers` are opt-in: pass them explicitly when the query calls for it.
+
+There are three distinct behaviours:
+
+| Behaviour | How to configure | Effect |
+|-----------|-----------------|--------|
+| **Default** | tier id is in `default_tiers` | Searched on every bare `rag_search()` call |
+| **Opt-in** | tier id is *not* in `default_tiers` | Only searched when caller passes `tiers=[...]` |
+| **Always-on** | tier has `"auto_include": true` | Always appended to results regardless of what `tiers` contains or what `default_tiers` says |
+
+**Important: passing `tiers` replaces the defaults — it does not add to them.** If you pass `tiers=["devops-general"]`, only `devops-general` is searched (plus any `auto_include` tiers). To extend the defaults, you must list them all:
+
+```python
+# Default: searches framework + project + common-issues, plus os-{distro} (always-on)
+rag_search(query="how does routing work")
+
+# Replacing defaults — only devops-general is searched (plus os-{distro} always-on)
+rag_search(query="docker bridge networking", tiers=["devops-general"])
+
+# Extending defaults — all four tiers explicitly listed
+rag_search(query="docker bridge networking", tiers=["framework", "project", "common-issues", "devops-general"])
+```
+
+The `default_tiers` list is set in `tiers.json` and can be changed to match your project's search habits.
 
 ### KB naming convention
 

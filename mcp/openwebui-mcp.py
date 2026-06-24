@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-openwebui-mcp.py — Five-tier MCP stdio server bridging Hermes/Claude to Open WebUI RAG
+openwebui-mcp.py — Configurable-tier MCP stdio server bridging AI clients to Open WebUI RAG
 
-Tiers:
-  1  framework-{name}   PHP framework/CMS reference (Drupal, Symfony, WordPress, CakePHP, Laravel…)
-  2  project-{slug}     Per-project source code + project-specific devops/config
-  3  common-issues      Cross-cutting gotchas, bugs, non-obvious fixes (all stacks)
-  4  devops-general     Infrastructure reference — Docker, k8s, nginx, SSL (platform-agnostic)
-  5  os-{distro}        OS-specific reference — package names, firewall rules, SELinux, distro quirks
-                        Auto-included in every search when the KB exists (no caller action needed).
+Tier structure is loaded from tiers.json (auto-discovered or via RAG_TIERS_CONFIG env var).
+Falls back to a built-in 5-tier PHP/DevOps config if no tiers.json is found.
 
-Tools:
-  rag_search(query, k, tiers, framework, project)
-  rag_add_doc(name, content, tier, framework, project, tags)
-  rag_add_issue(name, content, tags)
-  rag_index_project(path, project)
-  rag_list_kbs()
+Tier types:
+  fixed     — one KB with a fixed name (e.g. "common-issues")
+  framework — KB per framework, auto-detected from composer.json (kb_pattern: "framework-{name}")
+  project   — KB per project, auto-detected from CWD basename (kb_pattern: "project-{slug}")
+  os        — KB per OS/distro, auto-detected from /etc/os-release (kb_pattern: "os-{distro}")
+
+Tier properties:
+  auto_include: true — always appended to rag_search() results when the KB exists,
+                       regardless of what tiers the caller passes or what default_tiers says
+
+Tools: rag_search, rag_add_doc, rag_add_issue, rag_index_project, rag_list_kbs
 
 Config via environment:
   OPENWEBUI_URL      base URL (default: http://localhost:3000)
   OPENWEBUI_TOKEN    JWT auth token
-  RAG_CWD_DETECT     set to "1" to auto-detect project/framework from CWD (default: 1)
+  RAG_CWD_DETECT     "1" to auto-detect project/framework from CWD (default: 1)
+  RAG_TIERS_CONFIG   explicit path to tiers.json (overrides auto-discovery)
 
-OS detection: _detect_os() identifies distro at startup; _os_kb_name() maps it to os-{distro}.
-Every rag_search() auto-includes os-{distro} when that KB exists.
-
-MCP transport: NDJSON (newline-delimited JSON-RPC 2.0, Hermes v0.16+ format)
+MCP transport: NDJSON (newline-delimited JSON-RPC 2.0)
 """
 
 import json
@@ -44,17 +42,93 @@ BASE       = os.environ.get("OPENWEBUI_URL",   "http://localhost:3000")
 TOKEN      = os.environ.get("OPENWEBUI_TOKEN", "")
 CWD_DETECT = os.environ.get("RAG_CWD_DETECT",  "1") == "1"
 
-# Paths excluded when indexing projects
 EXCLUDED_DIRS = {
     "vendor", "var", "node_modules", "core", ".git", ".idea",
     "__pycache__", "dist", "build", "cache", ".cache",
 }
-
-# File types indexed from project source
 INDEXED_EXTENSIONS = {".php", ".twig", ".yml", ".yaml", ".env.example", ".md"}
 
 # ---------------------------------------------------------------------------
-# KB cache — name → id, populated at startup and refreshed on demand
+# Tier registry — populated at startup from tiers.json
+# ---------------------------------------------------------------------------
+TIER_REGISTRY: list[dict] = []
+DEFAULT_TIERS: list[str]  = []
+
+_BUILTIN_CONFIG: dict = {
+    "default_tiers": ["framework", "project", "common-issues"],
+    "tiers": [
+        {
+            "id": "framework", "type": "framework",
+            "kb_pattern": "framework-{name}", "label": "Tier 1",
+            "description": "Framework/CMS reference — hooks, APIs, services, patterns",
+        },
+        {
+            "id": "project", "type": "project",
+            "kb_pattern": "project-{slug}", "label": "Tier 2",
+            "description": "Per-project source code and project-specific configuration",
+        },
+        {
+            "id": "common-issues", "type": "fixed",
+            "kb": "common-issues", "label": "Tier 3",
+            "description": "Cross-cutting gotchas, bugs, and non-obvious fixes across all stacks",
+        },
+        {
+            "id": "devops-general", "type": "fixed",
+            "kb": "devops-general", "label": "Tier 4",
+            "description": "Infrastructure reference: Docker, k8s, nginx, SSL (platform-agnostic)",
+        },
+        {
+            "id": "os", "type": "os",
+            "kb_pattern": "os-{distro}", "label": "Tier 5",
+            "description": "OS-specific reference: package names, firewall rules, SELinux, distro-specific fixes",
+            "auto_include": True,
+        },
+    ],
+}
+
+
+def _find_tiers_config() -> Path | None:
+    """Locate tiers.json: explicit env var → $RAG_INSTALL_DIR → repo root next to this script."""
+    if env := os.environ.get("RAG_TIERS_CONFIG"):
+        p = Path(env)
+        return p if p.exists() else None
+    p = Path(os.environ.get("RAG_INSTALL_DIR", "/opt/rag-stack")) / "tiers.json"
+    if p.exists():
+        return p
+    # Dev path: script lives at mcp/openwebui-mcp.py, tiers.json is at repo root
+    p = Path(__file__).parent.parent / "tiers.json"
+    if p.exists():
+        return p
+    return None
+
+
+def _load_tiers() -> None:
+    """Populate TIER_REGISTRY and DEFAULT_TIERS from tiers.json, or built-in defaults."""
+    global TIER_REGISTRY, DEFAULT_TIERS
+    config_path = _find_tiers_config()
+    if config_path:
+        try:
+            data = json.loads(config_path.read_text())
+            TIER_REGISTRY = data.get("tiers", [])
+            DEFAULT_TIERS = data.get("default_tiers", [])
+            print(
+                f"openwebui-mcp: tiers loaded from {config_path} ({len(TIER_REGISTRY)} tiers)",
+                file=sys.stderr,
+            )
+            return
+        except Exception as e:
+            print(
+                f"openwebui-mcp: warning: failed to load {config_path}: {e} — using built-in defaults",
+                file=sys.stderr,
+            )
+    else:
+        print("openwebui-mcp: tiers.json not found — using built-in defaults", file=sys.stderr)
+    TIER_REGISTRY = _BUILTIN_CONFIG["tiers"]
+    DEFAULT_TIERS = _BUILTIN_CONFIG["default_tiers"]
+
+
+# ---------------------------------------------------------------------------
+# KB cache — name → id
 # ---------------------------------------------------------------------------
 _KB_CACHE: dict[str, str] = {}
 
@@ -62,7 +136,7 @@ _KB_CACHE: dict[str, str] = {}
 def _refresh_kb_cache() -> None:
     global _KB_CACHE
     try:
-        resp = _http("GET", "/api/v1/knowledge/")
+        resp  = _http("GET", "/api/v1/knowledge/")
         items = resp if isinstance(resp, list) else resp.get("data", resp.get("items", []))
         _KB_CACHE = {item["name"]: item["id"] for item in items if "name" in item and "id" in item}
     except Exception as e:
@@ -84,19 +158,16 @@ def _ensure_kb(name: str) -> str:
 
 
 def _kb_description(name: str) -> str:
-    if name.startswith("framework-"):
-        fw = name[len("framework-"):]
-        return f"Tier 1 — {fw.title()} framework/CMS reference: hooks, APIs, services, patterns"
-    if name.startswith("project-"):
-        proj = name[len("project-"):]
-        return f"Tier 2 — Project '{proj}' source code and project-specific configuration"
-    if name == "common-issues":
-        return "Tier 3 — Cross-cutting gotchas, bugs, and non-obvious fixes across all stacks"
-    if name == "devops-general":
-        return "Tier 4 — Infrastructure reference: Docker, k8s, nginx, SSL (platform-agnostic)"
-    if name.startswith("os-"):
-        distro = name[len("os-"):]
-        return f"Tier 5 — {distro.title()} OS reference: package names, firewall rules, SELinux, distro-specific fixes"
+    """Generate a description for a new KB by matching its name against the tier registry."""
+    for tier in TIER_REGISTRY:
+        label = tier.get("label", tier["id"])
+        desc  = tier["description"]
+        if tier["type"] == "fixed" and tier.get("kb") == name:
+            return f"{label} — {desc}"
+        prefix = tier.get("kb_pattern", "").split("{")[0]
+        if prefix and name.startswith(prefix):
+            suffix = name[len(prefix):]
+            return f"{label} — {suffix.title()} {desc}" if suffix else f"{label} — {desc}"
     return f"RAG knowledge base: {name}"
 
 
@@ -105,7 +176,7 @@ def _kb_description(name: str) -> str:
 # ---------------------------------------------------------------------------
 def _detect_context(cwd: str | None = None) -> tuple[str | None, str | None]:
     """Return (project_slug, framework) inferred from the given directory."""
-    cwd = cwd or os.getcwd()
+    cwd  = cwd or os.getcwd()
     root = Path(cwd)
     project = root.name
 
@@ -113,7 +184,7 @@ def _detect_context(cwd: str | None = None) -> tuple[str | None, str | None]:
     if composer.exists():
         try:
             data = json.loads(composer.read_text())
-            req = {**data.get("require", {}), **data.get("require-dev", {})}
+            req  = {**data.get("require", {}), **data.get("require-dev", {})}
             if "symfony/framework-bundle" in req:
                 return project, "symfony"
             if "drupal/core" in req or "drupal/core-recommended" in req:
@@ -155,15 +226,13 @@ def _detect_os() -> str:
     return "unknown"
 
 
-def _os_kb_name() -> str:
-    """Return the Tier 5 KB name for the current host, e.g. 'os-fedora', 'os-macos'."""
-    tag = _detect_os()  # e.g. "linux-fedora", "macos", "linux"
-    short = tag.removeprefix("linux-")  # "linux-fedora" → "fedora", "macos" → "macos"
-    return f"os-{short}"
+def _os_distro() -> str:
+    """Return just the distro name used in kb_pattern substitution: 'fedora', 'macos', etc."""
+    return _detect_os().removeprefix("linux-")
 
 
 # ---------------------------------------------------------------------------
-# Open WebUI HTTP helpers
+# HTTP helpers
 # ---------------------------------------------------------------------------
 def _http(method: str, path: str, data=None, files=None):
     url = f"{BASE}{path}"
@@ -179,12 +248,12 @@ def _http(method: str, path: str, data=None, files=None):
             body_part = content if isinstance(content, bytes) else content.encode()
             parts.append(header + body_part + b"\r\n")
         body = b"".join(parts) + f"--{boundary}--\r\n".encode()
-        req = urllib.request.Request(url, data=body, method=method)
+        req  = urllib.request.Request(url, data=body, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     elif data is not None:
         body = json.dumps(data).encode()
-        req = urllib.request.Request(url, data=body, method=method)
+        req  = urllib.request.Request(url, data=body, method=method)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("Content-Type", "application/json")
     else:
@@ -198,11 +267,10 @@ def _http(method: str, path: str, data=None, files=None):
 
 
 def _upload_file(name: str, content: str | bytes, kb_id: str) -> str:
-    """Upload a file, replace any existing file with the same name, add to KB."""
-    # Remove existing file with this name from the KB
+    """Upload a file, replacing any existing file with the same name in the KB."""
     try:
         existing = _http("GET", "/api/v1/files/")
-        items = existing if isinstance(existing, list) else existing.get("items", [])
+        items    = existing if isinstance(existing, list) else existing.get("items", [])
         for f in items:
             if f.get("meta", {}).get("name") == name:
                 fid = f["id"]
@@ -215,9 +283,8 @@ def _upload_file(name: str, content: str | bytes, kb_id: str) -> str:
     except Exception:
         pass
 
-    new_file = _http("POST", "/api/v1/files/",
-                     files={"file": (name, content, "text/plain")})
-    fid = new_file["id"]
+    new_file = _http("POST", "/api/v1/files/", files={"file": (name, content, "text/plain")})
+    fid      = new_file["id"]
     _http("POST", f"/api/v1/knowledge/{kb_id}/file/add", {"file_id": fid})
     return fid
 
@@ -225,42 +292,51 @@ def _upload_file(name: str, content: str | bytes, kb_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Tier / KB resolution
 # ---------------------------------------------------------------------------
+def _resolve_kb_name(tier: dict, framework: str | None, project: str | None) -> str | None:
+    """Return the concrete KB name for a tier given the current context, or None if unresolvable."""
+    t = tier["type"]
+    if t == "fixed":
+        return tier.get("kb")
+    pattern = tier.get("kb_pattern", "")
+    if t == "framework":
+        return pattern.replace("{name}", framework.lower()) if framework else None
+    if t == "project":
+        return pattern.replace("{slug}", project.lower()) if project else None
+    if t == "os":
+        return pattern.replace("{distro}", _os_distro())
+    return None
+
+
 def _resolve_kb_ids(tiers: list, framework: str | None, project: str | None) -> list[str]:
-    """Map tiers + context to concrete KB ids that exist in the cache."""
-    ids = []
-    for tier in tiers:
-        if tier == "framework":
-            if framework:
-                name = f"framework-{framework}"
-                if name in _KB_CACHE:
-                    ids.append(_KB_CACHE[name])
-            else:
-                # search all framework-* KBs
-                ids.extend(v for k, v in _KB_CACHE.items() if k.startswith("framework-"))
-        elif tier == "project":
-            if project:
-                name = f"project-{project}"
-                if name in _KB_CACHE:
-                    ids.append(_KB_CACHE[name])
-        elif tier == "common-issues":
-            if "common-issues" in _KB_CACHE:
-                ids.append(_KB_CACHE["common-issues"])
-        elif tier == "devops-general":
-            if "devops-general" in _KB_CACHE:
-                ids.append(_KB_CACHE["devops-general"])
-        elif tier == "os":
-            os_name = _os_kb_name()
-            if os_name in _KB_CACHE:
-                ids.append(_KB_CACHE[os_name])
-    # deduplicate, preserve order
-    seen = set()
+    """Map a list of tier IDs to concrete KB IDs present in the cache."""
+    ids: list[str] = []
+    for tier_id in tiers:
+        tier = next((t for t in TIER_REGISTRY if t["id"] == tier_id), None)
+        if not tier:
+            continue
+        if tier["type"] == "framework" and not framework:
+            # No framework specified — include all matching KBs
+            prefix = tier.get("kb_pattern", "").split("{")[0]
+            ids.extend(v for k, v in _KB_CACHE.items() if prefix and k.startswith(prefix))
+        else:
+            name = _resolve_kb_name(tier, framework, project)
+            if name and name in _KB_CACHE:
+                ids.append(_KB_CACHE[name])
+    seen: set = set()
     return [x for x in ids if not (x in seen or seen.add(x))]
+
+
+def _project_kb_name(slug: str) -> str:
+    """Return the KB name for a project slug using the configured project-type tier pattern."""
+    for tier in TIER_REGISTRY:
+        if tier["type"] == "project":
+            return tier["kb_pattern"].replace("{slug}", slug.lower())
+    return f"project-{slug}"
 
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
-
 def rag_search(
     query: str,
     k: int = 5,
@@ -268,8 +344,9 @@ def rag_search(
     framework: str | None = None,
     project: str | None = None,
 ) -> str:
+    # None means "use defaults"; an explicit list replaces the defaults entirely
     if tiers is None:
-        tiers = ["framework", "project", "common-issues"]
+        tiers = list(DEFAULT_TIERS)
 
     if CWD_DETECT:
         det_project, det_framework = _detect_context()
@@ -281,26 +358,29 @@ def rag_search(
     _refresh_kb_cache()
     kb_ids = _resolve_kb_ids(tiers, framework, project)
 
-    # Auto-include os-{distro} KB (Tier 5) when it exists, unless caller already specified "os"
-    if "os" not in tiers:
-        os_id = _KB_CACHE.get(_os_kb_name())
-        if os_id and os_id not in kb_ids:
-            kb_ids.append(os_id)
+    # Always append auto_include tiers when their KB exists, regardless of tiers list
+    for tier in TIER_REGISTRY:
+        if not tier.get("auto_include") or tier["id"] in tiers:
+            continue
+        name = _resolve_kb_name(tier, framework, project)
+        if name:
+            kb_id = _KB_CACHE.get(name)
+            if kb_id and kb_id not in kb_ids:
+                kb_ids.append(kb_id)
 
     if not kb_ids:
         avail = ", ".join(sorted(_KB_CACHE)) or "none"
         return (
             f"No knowledge bases matched tiers={tiers} framework={framework} project={project}.\n"
             f"Available KBs: {avail}\n"
-            f"Use rag_list_kbs() to see all KBs, or rag_index_project() to create a project KB."
+            "Use rag_list_kbs() to see all KBs, or rag_index_project() to create a project KB."
         )
 
-    result = _http("POST", "/api/v1/retrieval/query/collection", {
+    result    = _http("POST", "/api/v1/retrieval/query/collection", {
         "collection_names": kb_ids,
         "query": query,
         "k": k,
     })
-
     docs      = result.get("documents", [[]])[0]
     metas     = result.get("metadatas", [[]])[0]
     distances = result.get("distances",  [[]])[0]
@@ -308,7 +388,7 @@ def rag_search(
     if not docs:
         return f"No results for {query!r} across {len(kb_ids)} KB(s)."
 
-    ctx = f"tiers={tiers}, framework={framework or 'any'}, project={project or 'none'}"
+    ctx   = f"tiers={tiers}, framework={framework or 'any'}, project={project or 'none'}"
     lines = [f"Query: {query!r} [{ctx}]\n"]
     for i, (doc, meta, dist) in enumerate(zip(docs, metas, distances), 1):
         source = meta.get("name", "unknown")
@@ -325,34 +405,33 @@ def rag_add_doc(
     project: str | None = None,
     tags: list | None = None,
 ) -> str:
-    tier = tier.strip().lower()
+    tier     = tier.strip().lower()
+    tier_def = next((t for t in TIER_REGISTRY if t["id"] == tier), None)
+    if not tier_def:
+        valid = " | ".join(t["id"] for t in TIER_REGISTRY)
+        return f"Error: unknown tier '{tier}'. Valid values: {valid}"
 
-    if tier == "framework":
+    t = tier_def["type"]
+    if t == "framework":
         if not framework:
-            return "Error: 'framework' param required when tier='framework' (e.g. drupal, symfony)"
-        kb_name = f"framework-{framework.lower()}"
-    elif tier == "project":
+            return f"Error: 'framework' param required when tier='{tier}'"
+        kb_name = tier_def["kb_pattern"].replace("{name}", framework.lower())
+    elif t == "project":
         if not project:
             if CWD_DETECT:
                 project, _ = _detect_context()
             if not project:
-                return "Error: 'project' param required when tier='project'"
-        kb_name = f"project-{project.lower()}"
-    elif tier == "common-issues":
-        kb_name = "common-issues"
-    elif tier in ("devops-general", "devops"):
-        kb_name = "devops-general"
-    elif tier == "os":
-        kb_name = _os_kb_name()
+                return f"Error: 'project' param required when tier='{tier}'"
+        kb_name = tier_def["kb_pattern"].replace("{slug}", project.lower())
+    elif t == "fixed":
+        kb_name = tier_def["kb"]
+    elif t == "os":
+        kb_name = tier_def["kb_pattern"].replace("{distro}", _os_distro())
     else:
-        return (
-            f"Error: unknown tier '{tier}'. "
-            "Valid values: framework, project, common-issues, devops-general, os"
-        )
+        return f"Error: tier '{tier}' has unknown type '{t}'"
 
     if tags:
-        header = f"tags: {', '.join(tags)}\n\n"
-        content = header + content
+        content = f"tags: {', '.join(tags)}\n\n{content}"
 
     kb_id = _ensure_kb(kb_name)
     _upload_file(name, content, kb_id)
@@ -360,20 +439,26 @@ def rag_add_doc(
 
 
 def rag_add_issue(name: str, content: str, tags: list | None = None) -> str:
-    """Add a cross-cutting gotcha or bug fix to Tier 3 common-issues."""
-    kb_id = _ensure_kb("common-issues")
+    """Add a cross-cutting gotcha or bug fix. Targets the 'common-issues' fixed tier."""
+    tier_def = next(
+        (t for t in TIER_REGISTRY if t["id"] == "common-issues" and t["type"] == "fixed"),
+        None,
+    )
+    kb_name = tier_def["kb"] if tier_def else "common-issues"
+
     if tags:
         content = f"tags: {', '.join(tags)}\n\n{content}"
+    kb_id   = _ensure_kb(kb_name)
     _upload_file(name, content, kb_id)
     tag_str = ", ".join(tags) if tags else "none"
-    return f"Added issue '{name}' to common-issues (tags: {tag_str})."
+    return f"Added issue '{name}' to {kb_name} (tags: {tag_str})."
 
 
 def rag_index_project(path: str | None = None, project: str | None = None) -> str:
     """
-    Index a project's source into Tier 2. Auto-detects framework from composer.json
-    or directory structure. Clears and rebuilds project-{slug} KB from scratch.
-    Excludes vendor/, core/, node_modules/, var/, .git/.
+    Index a project's source into the project-type tier KB.
+    Auto-detects framework from composer.json or directory structure.
+    Clears and rebuilds the KB on each run.
     """
     root = Path(path or os.getcwd()).resolve()
     if not root.is_dir():
@@ -381,7 +466,7 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
 
     det_project, framework = _detect_context(str(root))
     slug    = (project or det_project).lower().replace(" ", "-")
-    kb_name = f"project-{slug}"
+    kb_name = _project_kb_name(slug)
 
     print(
         f"openwebui-mcp: indexing [{slug}] framework=[{framework or 'generic'}] from {root}",
@@ -393,12 +478,10 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
     # Clear existing content
     try:
         existing = _http("GET", "/api/v1/files/")
-        items = existing if isinstance(existing, list) else existing.get("items", [])
-        cleared = 0
+        items    = existing if isinstance(existing, list) else existing.get("items", [])
+        cleared  = 0
         for f in items:
-            meta = f.get("meta", {})
-            # Match files belonging to this KB by name prefix
-            if meta.get("name", "").startswith(f"{slug}--"):
+            if f.get("meta", {}).get("name", "").startswith(f"{slug}--"):
                 try:
                     _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": f["id"]})
                     _http("DELETE", f"/api/v1/files/{f['id']}")
@@ -410,12 +493,10 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
     except Exception as e:
         print(f"openwebui-mcp: warning: could not clear KB: {e}", file=sys.stderr)
 
-    # Walk project, upload indexed files
     uploaded = errors = 0
     for fpath in sorted(root.rglob("*")):
         if not fpath.is_file():
             continue
-        # Exclude by any path component
         if any(part in EXCLUDED_DIRS for part in fpath.relative_to(root).parts):
             continue
         if fpath.suffix not in INDEXED_EXTENSIONS:
@@ -429,7 +510,6 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
         if not content.strip():
             continue
 
-        # Name: project-slug--path--to--file.php
         rag_name = f"{slug}--{str(rel).replace('/', '--')}"
         try:
             _upload_file(rag_name, content, kb_id)
@@ -445,13 +525,12 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
     )
     print(f"openwebui-mcp: {result}", file=sys.stderr)
 
-    # Record path for auto-reindex recovery (rag start restores this on empty Qdrant)
     if uploaded > 0:
         indexes_conf = Path(os.environ.get("RAG_INSTALL_DIR", "/opt/rag-stack")) / "indexes.conf"
         try:
-            existing = indexes_conf.read_text().splitlines() if indexes_conf.exists() else []
+            existing_lines = indexes_conf.read_text().splitlines() if indexes_conf.exists() else []
             root_str = str(root)
-            if root_str not in existing:
+            if root_str not in existing_lines:
                 with indexes_conf.open("a") as fh:
                     fh.write(root_str + "\n")
         except Exception:
@@ -461,202 +540,199 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
 
 
 def rag_list_kbs() -> str:
-    """List all knowledge bases grouped by tier."""
+    """List all knowledge bases grouped by tier, with file counts."""
     _refresh_kb_cache()
     if not _KB_CACHE:
         return "No knowledge bases found. Use rag_add_doc() or rag_index_project() to create one."
 
-    tiers: dict[str, list[str]] = {
-        "1 — framework":      [],
-        "2 — project":        [],
-        "3 — common-issues":  [],
-        "4 — devops-general": [],
-        "5 — os":             [],
-        "other":              [],
-    }
+    buckets: dict[str, list[str]] = {t["id"]: [] for t in TIER_REGISTRY}
+    buckets["other"] = []
 
     for name in sorted(_KB_CACHE):
         kb_id = _KB_CACHE[name]
         try:
             detail = _http("GET", f"/api/v1/knowledge/{kb_id}")
-            files  = detail.get("files") or []
-            count  = len(files)
+            count  = len(detail.get("files") or [])
         except Exception:
-            count  = "?"
+            count = "?"
 
-        entry = f"  {name}  ({count} files)  [{kb_id[:8]}...]"
-        if name.startswith("framework-"):
-            tiers["1 — framework"].append(entry)
-        elif name.startswith("project-"):
-            tiers["2 — project"].append(entry)
-        elif name == "common-issues":
-            tiers["3 — common-issues"].append(entry)
-        elif name == "devops-general":
-            tiers["4 — devops-general"].append(entry)
-        elif name.startswith("os-"):
-            tiers["5 — os"].append(entry)
-        else:
-            tiers["other"].append(entry)
+        entry  = f"  {name}  ({count} files)  [{kb_id[:8]}...]"
+        bucket = "other"
+        for tier in TIER_REGISTRY:
+            if tier["type"] == "fixed" and tier.get("kb") == name:
+                bucket = tier["id"]
+                break
+            prefix = tier.get("kb_pattern", "").split("{")[0]
+            if prefix and name.startswith(prefix):
+                bucket = tier["id"]
+                break
+        buckets[bucket].append(entry)
 
     lines = [f"{len(_KB_CACHE)} knowledge base(s):"]
-    for tier_label, entries in tiers.items():
-        if entries:
-            lines.append(f"\nTier {tier_label}:")
-            lines.extend(entries)
+    for tier in TIER_REGISTRY:
+        tid = tier["id"]
+        if buckets[tid]:
+            label = tier.get("label", tid)
+            lines.append(f"\n{label} — {tid}:")
+            lines.extend(buckets[tid])
+    if buckets["other"]:
+        lines.append("\nOther:")
+        lines.extend(buckets["other"])
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# MCP tool registry
+# MCP tool registry — built dynamically after tiers are loaded
 # ---------------------------------------------------------------------------
-TOOLS = [
-    {
-        "name": "rag_search",
-        "description": (
-            "Search the RAG knowledge base across one or more tiers. "
-            "Call this FIRST before making changes — query for prior decisions, patterns, and fixes. "
-            "Auto-detects framework and project from CWD when not specified. "
-            "Tier 5 (os-{distro}) is automatically included when the KB exists — no need to add it. "
-            "Tiers: 'framework' (Tier 1 — PHP framework/CMS docs), "
-            "'project' (Tier 2 — current project code), "
-            "'common-issues' (Tier 3 — cross-cutting gotchas), "
-            "'devops-general' (Tier 4 — platform-agnostic infra: Docker, nginx, k8s), "
-            "'os' (Tier 5 — OS-specific: package names, firewall rules, distro quirks)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query",
-                },
-                "k": {
-                    "type": "integer",
-                    "description": "Number of results per KB (default 5)",
-                    "default": 5,
-                },
-                "tiers": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Tiers to search. Default: ['framework','project','common-issues']. "
-                        "os-{distro} (Tier 5) is always auto-included when the KB exists. "
-                        "Add 'devops-general' for platform-agnostic infrastructure topics."
-                    ),
-                    "default": ["framework", "project", "common-issues"],
-                },
-                "framework": {
-                    "type": "string",
-                    "description": "Framework filter: drupal, symfony, wordpress, cakephp, laravel. Auto-detected from CWD if omitted.",
-                },
-                "project": {
-                    "type": "string",
-                    "description": "Project slug (CWD basename). Auto-detected if omitted.",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "rag_add_doc",
-        "description": (
-            "Add or replace a document in a specific RAG tier. "
-            "Use after significant changes to scripts, configs, or session summaries. "
-            "Naming convention: NN-category--filename (e.g. '03-scripts--deploy.sh'). "
-            "tier='framework' requires framework param. "
-            "tier='project' auto-detects project from CWD. "
-            "tier='common-issues' for cross-cutting gotchas. "
-            "tier='devops-general' for platform-agnostic infrastructure reference docs. "
-            "tier='os' for OS-specific fixes — auto-detects distro (e.g. os-fedora on Fedora)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name":      {"type": "string", "description": "Filename slug"},
-                "content":   {"type": "string", "description": "Document content"},
-                "tier":      {"type": "string", "description": "framework | project | common-issues | devops-general | os"},
-                "framework": {"type": "string", "description": "Required when tier=framework"},
-                "project":   {"type": "string", "description": "Project slug — defaults to CWD basename"},
-                "tags":      {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
-            },
-            "required": ["name", "content", "tier"],
-        },
-    },
-    {
-        "name": "rag_add_issue",
-        "description": (
-            "Add a cross-cutting issue, gotcha, or bug fix to Tier 3 (common-issues). "
-            "Use immediately after solving something non-obvious — don't wait for session end. "
-            "Tag with affected stack, symptom keywords, and OS if relevant to Tier 4."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short slug, e.g. 'docker-firewalld-zone-conflict'",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Problem description, root cause, and fix",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "e.g. ['docker', 'linux', 'firewalld', 'networking']",
-                },
-            },
-            "required": ["name", "content"],
-        },
-    },
-    {
-        "name": "rag_index_project",
-        "description": (
-            "Index a project's source files into Tier 2 (project-{slug} KB). "
-            "Auto-detects framework from composer.json or directory structure. "
-            "Clears and rebuilds the KB on each run — always reflects current source. "
-            "Excludes vendor/, core/, node_modules/, var/, .git/. "
-            "Indexes .php, .twig, .yml, .yaml, .env.example, .md files."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path":    {"type": "string", "description": "Absolute project root path (defaults to CWD)"},
-                "project": {"type": "string", "description": "Slug override (defaults to directory name)"},
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "rag_list_kbs",
-        "description": "List all knowledge bases grouped by tier, with file counts.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-]
+TOOLS: list[dict] = []
 
 TOOL_FNS: dict[str, callable] = {
     "rag_search":        lambda a: rag_search(
-                             a["query"],
-                             int(a.get("k", 5)),
-                             a.get("tiers"),
-                             a.get("framework"),
-                             a.get("project"),
+                             a["query"], int(a.get("k", 5)),
+                             a.get("tiers"), a.get("framework"), a.get("project"),
                          ),
     "rag_add_doc":       lambda a: rag_add_doc(
                              a["name"], a["content"], a["tier"],
                              a.get("framework"), a.get("project"), a.get("tags"),
                          ),
-    "rag_add_issue":     lambda a: rag_add_issue(
-                             a["name"], a["content"], a.get("tags"),
-                         ),
+    "rag_add_issue":     lambda a: rag_add_issue(a["name"], a["content"], a.get("tags")),
     "rag_index_project": lambda a: rag_index_project(a.get("path"), a.get("project")),
     "rag_list_kbs":      lambda a: rag_list_kbs(),
 }
 
-# ---------------------------------------------------------------------------
-# MCP stdio transport — NDJSON (one JSON object per line, Hermes v0.16+ format)
-# ---------------------------------------------------------------------------
 
+def _build_tools() -> list[dict]:
+    """Build MCP tool schemas reflecting the loaded tier configuration."""
+    valid_tiers = " | ".join(t["id"] for t in TIER_REGISTRY)
+    auto_ids    = [t["id"] for t in TIER_REGISTRY if t.get("auto_include")]
+    auto_note   = (
+        f" Tier(s) {', '.join(auto_ids)} are always auto-included when their KB exists."
+        if auto_ids else ""
+    )
+
+    return [
+        {
+            "name": "rag_search",
+            "description": (
+                "Search the RAG knowledge base across one or more tiers. "
+                "Call this FIRST before making changes — query for prior decisions, patterns, and fixes. "
+                f"Default tiers (when tiers is omitted): {DEFAULT_TIERS}. "
+                "Passing tiers replaces the defaults — it does not add to them. "
+                f"{auto_note} "
+                "Auto-detects framework and project from CWD when not specified."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "k": {
+                        "type": "integer",
+                        "description": "Results per KB (default 5)",
+                        "default": 5,
+                    },
+                    "tiers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            f"Tiers to search. Omit to use defaults {DEFAULT_TIERS}. "
+                            "Providing this list replaces the defaults entirely — include all tiers you want. "
+                            f"Auto-include tiers ({', '.join(auto_ids) if auto_ids else 'none'}) "
+                            "are always appended regardless."
+                        ),
+                        "default": DEFAULT_TIERS,
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Framework filter (auto-detected from CWD if omitted)",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project slug (auto-detected from CWD if omitted)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "rag_add_doc",
+            "description": (
+                "Add or replace a document in a specific RAG tier. "
+                "Use after significant changes to scripts, configs, or session summaries. "
+                "Naming convention: NN-category--filename (e.g. '03-scripts--deploy.sh'). "
+                f"tier: {valid_tiers}. "
+                "framework type requires framework param; "
+                "project type auto-detects from CWD; "
+                "os type auto-detects host distro."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name":      {"type": "string", "description": "Filename slug"},
+                    "content":   {"type": "string", "description": "Document content"},
+                    "tier":      {"type": "string", "description": f"Tier ID: {valid_tiers}"},
+                    "framework": {"type": "string", "description": "Required when tier type is 'framework'"},
+                    "project":   {"type": "string", "description": "Project slug — defaults to CWD basename"},
+                    "tags":      {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
+                },
+                "required": ["name", "content", "tier"],
+            },
+        },
+        {
+            "name": "rag_add_issue",
+            "description": (
+                "Add a cross-cutting issue, gotcha, or bug fix to the 'common-issues' KB. "
+                "Call immediately after solving something non-obvious — don't wait for session end. "
+                "Tag with affected stack, symptom keywords, and OS if relevant."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short slug, e.g. 'docker-firewalld-zone-conflict'",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Problem description, root cause, and fix",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "e.g. ['docker', 'linux', 'firewalld', 'networking']",
+                    },
+                },
+                "required": ["name", "content"],
+            },
+        },
+        {
+            "name": "rag_index_project",
+            "description": (
+                "Index a project's source files into the project-type tier KB. "
+                "Auto-detects framework from composer.json or directory structure. "
+                "Clears and rebuilds the KB on each run — always reflects current source. "
+                "Excludes vendor/, core/, node_modules/, var/, .git/. "
+                "Indexes .php, .twig, .yml, .yaml, .env.example, .md files."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Absolute project root path (defaults to CWD)"},
+                    "project": {"type": "string", "description": "Slug override (defaults to directory name)"},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "rag_list_kbs",
+            "description": "List all knowledge bases grouped by tier, with file counts.",
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# MCP stdio transport — NDJSON (one JSON object per line)
+# ---------------------------------------------------------------------------
 def send(msg: dict) -> None:
     sys.stdout.write(json.dumps(msg) + "\n")
     sys.stdout.flush()
@@ -682,12 +758,12 @@ def handle(req: dict) -> dict | None:
             "result": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "openwebui-mcp", "version": "2.0.0"},
+                "serverInfo": {"name": "openwebui-mcp", "version": "3.0.0"},
             },
         }
 
     if method == "notifications/initialized":
-        return None  # notification — no response
+        return None
 
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
@@ -724,14 +800,19 @@ def handle(req: dict) -> dict | None:
 
 
 def main() -> None:
+    global TOOLS
     if not TOKEN:
         print("ERROR: OPENWEBUI_TOKEN not set", file=sys.stderr)
         sys.exit(1)
 
+    _load_tiers()
     _refresh_kb_cache()
-    os_tag = _detect_os()
+    TOOLS = _build_tools()
+
+    os_tag   = _detect_os()
+    tier_ids = ", ".join(t["id"] for t in TIER_REGISTRY)
     print(
-        f"openwebui-mcp v2.0: {BASE} | {len(_KB_CACHE)} KBs loaded | OS={os_tag}",
+        f"openwebui-mcp v3.0: {BASE} | {len(_KB_CACHE)} KBs | OS={os_tag} | tiers=[{tier_ids}]",
         file=sys.stderr,
     )
 

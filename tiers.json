@@ -1,0 +1,42 @@
+{
+  "_comment": "RAG tier configuration. Copy and customize for your project. See README.md § Tier configuration for format docs.",
+  "default_tiers": ["framework", "project", "common-issues"],
+  "tiers": [
+    {
+      "id": "framework",
+      "type": "framework",
+      "kb_pattern": "framework-{name}",
+      "label": "Tier 1",
+      "description": "Framework/CMS reference — hooks, APIs, services, patterns"
+    },
+    {
+      "id": "project",
+      "type": "project",
+      "kb_pattern": "project-{slug}",
+      "label": "Tier 2",
+      "description": "Per-project source code and project-specific configuration"
+    },
+    {
+      "id": "common-issues",
+      "type": "fixed",
+      "kb": "common-issues",
+      "label": "Tier 3",
+      "description": "Cross-cutting gotchas, bugs, and non-obvious fixes across all stacks"
+    },
+    {
+      "id": "devops-general",
+      "type": "fixed",
+      "kb": "devops-general",
+      "label": "Tier 4",
+      "description": "Infrastructure reference: Docker, k8s, nginx, SSL (platform-agnostic)"
+    },
+    {
+      "id": "os",
+      "type": "os",
+      "kb_pattern": "os-{distro}",
+      "label": "Tier 5",
+      "description": "OS-specific reference: package names, firewall rules, SELinux, distro-specific fixes",
+      "auto_include": true
+    }
+  ]
+}

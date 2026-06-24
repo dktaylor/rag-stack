@@ -41,6 +41,7 @@ s mkdir -p "$DEST/data/qdrant" "$DEST/data/webui"
 s mkdir -p "$DEST/mcp" "$DEST/models"
 s cp "$SOURCE/docker-compose.yml"     "$DEST/docker-compose.yml"
 s cp "$SOURCE/models.conf"            "$DEST/models.conf"
+s cp "$SOURCE/tiers.json"            "$DEST/tiers.json"
 s cp "$SOURCE/mcp/openwebui-mcp.py"  "$DEST/mcp/openwebui-mcp.py"
 s cp "$SOURCE/mcp/rag_cli.py"        "$DEST/mcp/rag_cli.py"
 
