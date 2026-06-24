@@ -1,0 +1,61 @@
+# tests/docker-compose.test.yml — isolated RAG integration test stack
+#
+# Runs Open WebUI on host port 3001 and Qdrant on 6334 (no clash with the
+# production stack on 3000/6333). Named volumes are wiped on `down -v`.
+#
+# Usage: bash tests/run.sh [pytest-args...]
+#   or manually:
+#     docker compose -f tests/docker-compose.test.yml up -d qdrant open-webui
+#     OPENWEBUI_URL=http://localhost:3001 pytest tests/ -v
+#     docker compose -f tests/docker-compose.test.yml down -v
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rag-test-qdrant
+    volumes:
+      - rag-test-qdrant:/qdrant/storage:z
+    environment:
+      - QDRANT__SERVICE__ANALYTICS_TRACKING=false
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: rag-test-webui
+    ports:
+      - "3001:8080"
+    volumes:
+      - rag-test-webui:/app/backend/data:z
+    environment:
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - VECTOR_DB=qdrant
+      - QDRANT_URI=http://qdrant:6333
+      - RAG_EMBEDDING_ENGINE=ollama
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-nomic-embed-text}
+      - ENABLE_API_KEY=true
+      - ENABLE_API_KEYS=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - qdrant
+
+  test-runner:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile.test
+    container_name: rag-test-runner
+    environment:
+      # Internal Docker network URL — conftest.py reads this
+      - OPENWEBUI_URL=http://open-webui:8080
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - open-webui
+    volumes:
+      - ../mcp:/app/mcp:ro,z
+      - ../tiers.json:/app/tiers.json:ro,z
+      - ../tests:/app/tests:ro,z
+
+volumes:
+  rag-test-qdrant:
+  rag-test-webui:
