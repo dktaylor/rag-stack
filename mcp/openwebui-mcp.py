@@ -38,9 +38,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BASE       = os.environ.get("OPENWEBUI_URL",   "http://localhost:3000")
-TOKEN      = os.environ.get("OPENWEBUI_TOKEN", "")
-CWD_DETECT = os.environ.get("RAG_CWD_DETECT",  "1") == "1"
+BASE            = os.environ.get("OPENWEBUI_URL",       "http://localhost:3000")
+TOKEN           = os.environ.get("OPENWEBUI_TOKEN",     "")
+CWD_DETECT      = os.environ.get("RAG_CWD_DETECT",      "1") == "1"
+QDRANT_URL      = os.environ.get("QDRANT_URL",          "http://localhost:6333")
+QDRANT_COLL     = os.environ.get("QDRANT_COLLECTION",   "open-webui_knowledge")
 
 EXCLUDED_DIRS = {
     "vendor", "var", "node_modules", "core", ".git", ".idea",
@@ -266,22 +268,56 @@ def _http(method: str, path: str, data=None, files=None):
         raise RuntimeError(f"HTTP {e.code} {method} {path}: {e.read().decode()[:300]}")
 
 
-def _upload_file(name: str, content: str | bytes, kb_id: str) -> str:
-    """Upload a file, replacing any existing file with the same name in the KB."""
+def _purge_qdrant_vectors(kb_id: str) -> None:
+    """
+    Delete all Qdrant vectors whose tenant_id matches the KB UUID.
+
+    Open WebUI does not remove Qdrant vectors when files are deleted via its API,
+    leaving orphan vectors that cause HTTP 400 on subsequent re-uploads (content hash
+    collision). Calling this after clearing Open WebUI file records keeps the two
+    stores in sync.
+    """
     try:
-        existing = _http("GET", "/api/v1/files/")
-        items    = existing if isinstance(existing, list) else existing.get("items", [])
-        for f in items:
-            if f.get("meta", {}).get("name") == name:
-                fid = f["id"]
-                try:
-                    _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": fid})
-                    _http("DELETE", f"/api/v1/files/{fid}")
-                except Exception:
-                    pass
-                break
-    except Exception:
-        pass
+        payload = json.dumps({
+            "filter": {"must": [{"key": "tenant_id", "match": {"value": kb_id}}]}
+        }).encode()
+        req = urllib.request.Request(
+            f"{QDRANT_URL}/collections/{QDRANT_COLL}/points/delete",
+            data=payload,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            result = json.loads(r.read())
+            status = result.get("result", {}).get("status", "unknown")
+            print(f"openwebui-mcp: Qdrant purge KB={kb_id} status={status}", file=sys.stderr)
+    except Exception as e:
+        print(f"openwebui-mcp: Qdrant purge warning (non-fatal): {e}", file=sys.stderr)
+
+
+def _upload_file(name: str, content: str | bytes, kb_id: str, skip_dedup: bool = False) -> str:
+    """
+    Upload a file and attach it to a KB.
+
+    skip_dedup=True skips the existing-file lookup, which is O(n) per file and
+    causes quadratic slowdown during bulk indexing. Use it when the KB has already
+    been cleared (e.g. inside rag_index_project).
+    """
+    if not skip_dedup:
+        try:
+            existing = _http("GET", "/api/v1/files/")
+            items    = existing if isinstance(existing, list) else existing.get("items", [])
+            for f in items:
+                if f.get("meta", {}).get("name") == name:
+                    fid = f["id"]
+                    try:
+                        _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": fid})
+                        _http("DELETE", f"/api/v1/files/{fid}")
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
 
     new_file = _http("POST", "/api/v1/files/", files={"file": (name, content, "text/plain")})
     fid      = new_file["id"]
@@ -475,7 +511,7 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
 
     kb_id = _ensure_kb(kb_name)
 
-    # Clear existing content
+    # Clear existing content from Open WebUI file store
     try:
         existing = _http("GET", "/api/v1/files/")
         items    = existing if isinstance(existing, list) else existing.get("items", [])
@@ -492,6 +528,10 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
             print(f"openwebui-mcp: cleared {cleared} existing file(s) from {kb_name}", file=sys.stderr)
     except Exception as e:
         print(f"openwebui-mcp: warning: could not clear KB: {e}", file=sys.stderr)
+
+    # Purge orphan Qdrant vectors — Open WebUI does not remove vectors when files
+    # are deleted, leaving stale content hashes that cause HTTP 400 on re-upload.
+    _purge_qdrant_vectors(kb_id)
 
     uploaded = errors = 0
     for fpath in sorted(root.rglob("*")):
@@ -512,7 +552,7 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
 
         rag_name = f"{slug}--{str(rel).replace('/', '--')}"
         try:
-            _upload_file(rag_name, content, kb_id)
+            _upload_file(rag_name, content, kb_id, skip_dedup=True)
             uploaded += 1
         except Exception as e:
             print(f"openwebui-mcp: skipped {rel}: {e}", file=sys.stderr)

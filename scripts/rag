@@ -236,7 +236,7 @@ case "$cmd" in
     ;;
   restart)
     _require_stack; _require_env
-    _compose restart "${@:-}"
+    _compose restart "$@"
     ;;
   status)
     _require_stack
