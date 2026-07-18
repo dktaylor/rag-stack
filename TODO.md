@@ -2,6 +2,72 @@
 
 ## MCP server
 
+### BUG: bulk indexing silently drops files — stale /opt deploy lacks the retry mitigation (2026-07-18)
+
+**Symptom:** `rag_index_project` on prism reported `706 files uploaded, 4 errors`
+(MCP, ~18:50) and a repeat run reported `692 files uploaded, 18 errors` (CLI,
+~19:45). Every error is Open WebUI rejecting a **non-empty** file with
+`HTTP 400 …/file/add: {"detail":"400: The content provided is empty…"}`.
+A *different* random subset fails each run (`SiteSettingsRepository.php`,
+`WidgetCspBuilder.php`, `docker-compose.prod.yml`, … — none remotely empty),
+so this is the known intermittent EMPTY_CONTENT rejection under sustained bulk
+load (~0.5–2.5 % of 710 files per run), not a content problem.
+
+**Root cause (two layers):**
+
+1. Open WebUI intermittently 400s valid uploads during bulk indexing —
+   already known; repo HEAD mitigates it with `_upload_with_retry()`
+   (3 attempts + qdrant half-success verification, commit `6856887`).
+2. **The deployed copy never got that fix.** Both the Claude Code MCP server
+   and the `rag` CLI execute `/opt/rag-stack/mcp/openwebui-mcp.py`
+   (`RAG_DIR = os.environ.get("RAG_INSTALL_DIR", "/opt/rag-stack")`), and that
+   copy has the qdrant purge but **no `_upload_with_retry`** — failures take
+   the old single-shot `skipped {file}` path. Verify:
+   `grep -c _upload_with_retry /opt/rag-stack/mcp/openwebui-mcp.py` → 0,
+   vs 2 in `mcp/openwebui-mcp.py` at repo HEAD. So transient 400s = files
+   silently absent from the project KB. As of 2026-07-18 `project-prism` is
+   missing the 18 files from the last run.
+
+**Repro:**
+```bash
+python3 mcp/rag_cli.py index /home/devuser/Projects/prism --project prism 2>&1 \
+  | grep skipped        # different non-empty files 400 each run
+```
+
+Files dropped in the 19:45 run (= the current gaps in `project-prism`; the
+earlier MCP run's 4 filenames are unrecoverable — stderr wasn't retained,
+which is what the "surface filenames in the result" fix below is about):
+`.php-cs-fixer.dist.php`, `ai-agents/docs/agents/reference/deployment-tls-letsencrypt.md`,
+`config/packages/messenger.yaml`, `config/packages/test/services.yaml`,
+`docker-compose.prod.yml`, `lib/PrismMarketingBundle/templates/docs/architecture.html.twig`,
+`lib/PrismOidcSsoBundle/src/PrismOidcSsoBundle.php`, `src/Command/CleanupOldAnalyticsCommand.php`,
+`src/Controller/Admin/WidgetPreviewController.php`, `src/Controller/Api/WidgetHierarchyController.php`,
+`src/Repository/SiteSettingsRepository.php`, `src/Routing/VersioningRouteLoader.php`,
+`src/Service/Export/TenantExportGenerator.php`, `src/Service/WidgetCspBuilder.php`,
+`src/ValueObject/Pagination.php`, `templates/admin/widget_new.html.twig`,
+`tests/Unit/Analytics/ForwarderTest.php`, `tests/Unit/Security/PasswordStrengthCheckerTest.php`
+
+**Fix:**
+- [x] Redeploy `mcp/` to `/opt/rag-stack` (install.sh path) so the retry/verify
+      mitigation actually runs; re-index affected projects; confirm errors → 0
+      (or `verified in qdrant` notes) across a few runs.
+      **Done 2026-07-18 (first run):** working-tree `mcp/*.py` deployed to
+      `/opt` (copies verified identical, stale `__pycache__` cleared);
+      prism re-index → **710 files uploaded, 0 errors** (all 18 gap files
+      recovered; `SiteSettingsRepository.php` confirmed retrievable via
+      `rag_search`). Note: a running MCP server keeps the old module until its
+      session restarts — verify runs went through the CLI. Keep an eye on the
+      next few indexes before calling the retry mitigation proven (this run
+      happened to hit zero retryable 400s).
+- [ ] Surface failed filenames in the MCP tool *result*, not just stderr —
+      the MCP client only sees the error count, and stderr isn't retained in
+      Claude Code's MCP logs; getting the filenames today required a full CLI
+      re-index.
+- [ ] Guard against install-drift generally: version string in the script +
+      a `rag doctor`-style check comparing repo HEAD vs deployed copy.
+- [ ] Cosmetic: CLI `index` prints the summary twice (function prints to
+      stderr and `cmd_index` prints the return value).
+
 ### Proactive synthesis tool (`rag_synthesize`)
 
 Add a tool that chains `rag_search` across multiple tiers, combines the retrieved

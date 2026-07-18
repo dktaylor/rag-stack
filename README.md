@@ -225,3 +225,4 @@ The MCP server searches in this order:
 
 - `docs/usage.md` — tier guide: getting started, adding content, search patterns, session workflow
 - `docs/webui-guide.md` — using Open WebUI and Qdrant dashboard without writing code
+- `docs/troubleshooting.md` — failure modes and diagnosis, starting with "MCP tools hang while every health check passes"
