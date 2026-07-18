@@ -29,6 +29,7 @@ MCP transport: NDJSON (newline-delimited JSON-RPC 2.0)
 import json
 import os
 import sys
+import time
 import uuid
 import platform
 import urllib.request
@@ -295,6 +296,93 @@ def _purge_qdrant_vectors(kb_id: str) -> None:
         print(f"openwebui-mcp: Qdrant purge warning (non-fatal): {e}", file=sys.stderr)
 
 
+def _list_files(prefix: str | None = None) -> list[dict]:
+    """
+    Return ALL file records, walking ?page= until exhausted.
+
+    GET /api/v1/files/ caps every response at one page (50 records observed;
+    skip/limit params are ignored, total rides in the envelope). Trusting a
+    single call silently breaks KB clears and name-dedup once the store
+    outgrows one page — file records then accumulate on every reindex
+    (8,047 stale prism rows by 2026-07-13).
+    """
+    out:  list[dict] = []
+    seen: set[str]   = set()
+    page = 1
+    while True:
+        resp  = _http("GET", f"/api/v1/files/?page={page}")
+        items = resp if isinstance(resp, list) else resp.get("items", [])
+        new   = [f for f in items if f.get("id") and f["id"] not in seen]
+        if not new:
+            break  # empty page, or server ignores ?page= — either way we're done
+        seen.update(f["id"] for f in new)
+        out.extend(new)
+        total = resp.get("total") if isinstance(resp, dict) else None
+        if total is not None and len(out) >= total:
+            break
+        page += 1
+    if prefix is not None:
+        out = [f for f in out if (f.get("meta") or {}).get("name", "").startswith(prefix)]
+    return out
+
+
+def _doc_in_qdrant(kb_id: str, name: str) -> bool:
+    """
+    True if any vector for doc `name` exists under the KB tenant.
+
+    Open WebUI can persist the file record AND its vectors while still
+    answering 400 (empty-content / duplicate-content) — status codes lie
+    about the end state, so verify against the vector store directly.
+    """
+    try:
+        payload = json.dumps({
+            "filter": {"must": [
+                {"key": "tenant_id",     "match": {"value": kb_id}},
+                {"key": "metadata.name", "match": {"value": name}},
+            ]},
+            "limit": 1,
+        }).encode()
+        req = urllib.request.Request(
+            f"{QDRANT_URL}/collections/{QDRANT_COLL}/points/scroll",
+            data=payload,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return bool(json.loads(r.read()).get("result", {}).get("points"))
+    except Exception:
+        return False
+
+
+def _upload_with_retry(name: str, content: str | bytes, kb_id: str,
+                       attempts: int = 3, backoff: float = 0.5) -> str:
+    """
+    Bulk-upload one doc, absorbing Open WebUI's transient 400s.
+
+    Under sustained bulk load Open WebUI intermittently rejects valid files
+    with EMPTY_CONTENT (~5% observed), and a failed request may still have
+    persisted the vectors. Flow per failure: check qdrant first (half-success
+    counts as success — retrying would hit duplicate-content against our own
+    ghost), else back off and retry.
+
+    Returns 'uploaded' | 'verified' | 'failed'.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            _upload_file(name, content, kb_id, skip_dedup=True)
+            return "uploaded"
+        except Exception as e:
+            last = e
+            if _doc_in_qdrant(kb_id, name):
+                return "verified"
+            if i < attempts - 1:
+                time.sleep(backoff * (i + 1))
+    print(f"openwebui-mcp: upload failed after {attempts} attempts: {name}: {last}",
+          file=sys.stderr)
+    return "failed"
+
+
 def _upload_file(name: str, content: str | bytes, kb_id: str, skip_dedup: bool = False) -> str:
     """
     Upload a file and attach it to a KB.
@@ -305,17 +393,14 @@ def _upload_file(name: str, content: str | bytes, kb_id: str, skip_dedup: bool =
     """
     if not skip_dedup:
         try:
-            existing = _http("GET", "/api/v1/files/")
-            items    = existing if isinstance(existing, list) else existing.get("items", [])
-            for f in items:
-                if f.get("meta", {}).get("name") == name:
+            for f in _list_files():
+                if (f.get("meta") or {}).get("name") == name:
                     fid = f["id"]
                     try:
                         _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": fid})
                         _http("DELETE", f"/api/v1/files/{fid}")
                     except Exception:
                         pass
-                    break
         except Exception:
             pass
 
@@ -511,19 +596,21 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
 
     kb_id = _ensure_kb(kb_name)
 
-    # Clear existing content from Open WebUI file store
+    # Clear existing content from Open WebUI file store — ALL records with this
+    # project's name prefix, across every page (ghosts from failed uploads and
+    # prior runs included), not just the ones attached to the current KB.
     try:
-        existing = _http("GET", "/api/v1/files/")
-        items    = existing if isinstance(existing, list) else existing.get("items", [])
-        cleared  = 0
-        for f in items:
-            if f.get("meta", {}).get("name", "").startswith(f"{slug}--"):
-                try:
-                    _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": f["id"]})
-                    _http("DELETE", f"/api/v1/files/{f['id']}")
-                    cleared += 1
-                except Exception:
-                    pass
+        cleared = 0
+        for f in _list_files(prefix=f"{slug}--"):
+            try:
+                _http("POST", f"/api/v1/knowledge/{kb_id}/file/remove", {"file_id": f["id"]})
+            except Exception:
+                pass  # ghost record never attached (or attached to a stale KB id)
+            try:
+                _http("DELETE", f"/api/v1/files/{f['id']}")
+                cleared += 1
+            except Exception:
+                pass
         if cleared:
             print(f"openwebui-mcp: cleared {cleared} existing file(s) from {kb_name}", file=sys.stderr)
     except Exception as e:
@@ -533,7 +620,7 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
     # are deleted, leaving stale content hashes that cause HTTP 400 on re-upload.
     _purge_qdrant_vectors(kb_id)
 
-    uploaded = errors = 0
+    uploaded = verified = errors = 0
     for fpath in sorted(root.rglob("*")):
         if not fpath.is_file():
             continue
@@ -551,16 +638,18 @@ def rag_index_project(path: str | None = None, project: str | None = None) -> st
             continue
 
         rag_name = f"{slug}--{str(rel).replace('/', '--')}"
-        try:
-            _upload_file(rag_name, content, kb_id, skip_dedup=True)
-            uploaded += 1
-        except Exception as e:
-            print(f"openwebui-mcp: skipped {rel}: {e}", file=sys.stderr)
+        outcome  = _upload_with_retry(rag_name, content, kb_id)
+        if outcome == "failed":
             errors += 1
+        else:
+            uploaded += 1
+            if outcome == "verified":
+                verified += 1
 
     result = (
         f"Indexed '{slug}' (framework: {framework or 'generic'}) → {kb_name}\n"
         f"  {uploaded} files uploaded"
+        + (f" ({verified} verified in qdrant after retryable 400s)" if verified else "")
         + (f", {errors} errors" if errors else "")
     )
     print(f"openwebui-mcp: {result}", file=sys.stderr)
